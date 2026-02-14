@@ -4,10 +4,6 @@ import cn.hutool.core.io.IoUtil;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.crypto.digest.DigestUtil;
 import com.aliyun.oss.OSS;
-import com.microsoft.playwright.Browser;
-import com.microsoft.playwright.BrowserType;
-import com.microsoft.playwright.Page;
-import com.microsoft.playwright.Playwright;
 import com.aliyun.oss.OSSClientBuilder;
 import com.aliyun.oss.model.ObjectMetadata;
 import org.springframework.ai.tool.annotation.Tool;
@@ -41,21 +37,7 @@ public class McpService {
 	@Value("${oss.bucket-name:}")
 	private String ossBucketName;
 
-	/** 抖音短链正则（与 Dify 中 [CODE] 检测抖音链接 一致） */
-	private static final java.util.regex.Pattern DOUYIN_LINK_PATTERN = java.util.regex.Pattern
-			.compile("https?://v\\.douyin\\.com/[a-zA-Z0-9_-]+/?");
-
 	public McpService() {
-	}
-
-	/**
-	 * A sample tool. Return string 'Hello World!'
-	 *
-	 * @return String
-	 */
-	@Tool(description = "Return string 'Hello World!'")
-	public String helloWorld() {
-		return "Hello World!";
 	}
 
 	/** OSS 顶层：原始地址（raw_url）目录，其下为 {md5(raw_url)}/，内仅存指向 mp4 目录的说明 */
@@ -254,131 +236,5 @@ public class McpService {
 			map.put("path", path);
 		}
 		return map;
-	}
-
-	/**
-	 * 根据 bucket 和 path 拼接 OSS 公网访问地址（与 Dify 中 [CODE] 解析历史下载记录 一致：bucket.oss-cn-shanghai.aliyuncs.com）。
-	 * 若 endpoint 已包含 region（如 oss-cn-shanghai.aliyuncs.com），则使用该 host。
-	 */
-	private String buildOssPublicUrl(String bucket, String path) {
-		if (StrUtil.isBlank(ossEndpoint) || StrUtil.isBlank(bucket) || StrUtil.isBlank(path)) {
-			return null;
-		}
-		String host = ossEndpoint.replaceFirst("^https?://", "").trim();
-		return "https://" + bucket + "." + host + "/" + path;
-	}
-
-	/**
-	 * 一体化 MCP 工具：用户输入抖音分享链接，输出上传到 OSS 后的公网地址。
-	 * 流程：检测抖音链接 → 查 OSS 是否已有该 raw_url 对应视频 → 若无则调用 Chromium 抓取页内视频地址 → 下载并上传 OSS → 返回 OSS 地址。
-	 *
-	 * @param douyinShareLink 抖音分享链接（如 https://v.douyin.com/xxx），必填
-	 * @param ossBucket       OSS 桶名，不填则使用配置文件中的 oss.bucket-name
-	 * @return 包含 success、message、ossUrl（成功时为 OSS 公网地址）、path、bucket 等
-	 */
-	@Tool(description = "输入抖音分享链接，先查 OSS 是否已有该视频；若无则用 Playwright 打开页面抓取视频地址并下载上传到 OSS，最终输出上传到 OSS 中的公网地址。")
-	public Map<String, Object> parseDouyinLinkAndGetOssUrl(
-			@ToolParam(required = true, description = "抖音分享链接，例如 https://v.douyin.com/xxxxx") String douyinShareLink,
-			@ToolParam(required = false, description = "OSS 桶名，不填则使用配置文件中的 oss.bucket-name") String ossBucket) {
-		Map<String, Object> out = new LinkedHashMap<>();
-		out.put("success", false);
-		out.put("message", "");
-		out.put("ossUrl", (String) null);
-
-		String query = StrUtil.isNotBlank(douyinShareLink) ? douyinShareLink.trim() : "";
-		java.util.regex.Matcher matcher = DOUYIN_LINK_PATTERN.matcher(query);
-		String detectedUrl = null;
-		if (matcher.find()) {
-			String raw = matcher.group(0).trim();
-			detectedUrl = raw.replaceAll("[\\u4e00-\\u9fa5\\s]+$", "").replaceAll("[^\\w\\/\\?\\&\\.\\=\\-\\_]+$", "");
-		}
-		if (StrUtil.isBlank(detectedUrl)) {
-			out.put("message", "未检测到有效的抖音分享链接，请提供如 https://v.douyin.com/xxxxx 格式的链接");
-			return out;
-		}
-
-		String bucket = StrUtil.isNotBlank(ossBucket) ? ossBucket.trim() : ossBucketName;
-		if (StrUtil.isBlank(bucket) || StrUtil.isBlank(ossEndpoint) || StrUtil.isBlank(ossAccessKeyId)
-				|| StrUtil.isBlank(ossAccessKeySecret)) {
-			out.put("message", "OSS 未配置完整，请配置 oss.endpoint、oss.access-key-id、oss.access-key-secret、oss.bucket-name");
-			return out;
-		}
-
-		// 1) 是否历史已下载
-		Map<String, Object> existsResult = existsVideoByRawUrl(detectedUrl, bucket);
-		Boolean exists = existsResult != null ? (Boolean) existsResult.get("exists") : null;
-		if (Boolean.TRUE.equals(exists)) {
-			String path = (String) existsResult.get("path");
-			if (StrUtil.isNotBlank(path)) {
-				String ossUrl = buildOssPublicUrl(bucket, path);
-				out.put("success", true);
-				out.put("message", "命中 OSS 缓存");
-				out.put("ossUrl", ossUrl);
-				out.put("path", path);
-				out.put("bucket", bucket);
-				return out;
-			}
-		}
-
-		// 2) 用 Playwright 打开抖音页抓取 video source 的 src（aweme 视频地址）
-		String mp4Url = null;
-		try {
-			mp4Url = scrapeDouyinVideoUrlWithPlaywright(detectedUrl);
-		} catch (Exception e) {
-			out.put("message", "Playwright 抓取失败: " + e.getMessage());
-			return out;
-		}
-		if (StrUtil.isBlank(mp4Url)) {
-			out.put("message", "解析抖音页面未得到视频地址，请确认链接有效且页面内存在 video source");
-			return out;
-		}
-
-		// 3) 下载并上传 OSS
-		Map<String, Object> uploadResult = downloadMp4AndUploadToOss(mp4Url, detectedUrl, bucket);
-		Boolean uploadOk = uploadResult != null ? (Boolean) uploadResult.get("success") : null;
-		if (!Boolean.TRUE.equals(uploadOk)) {
-			out.put("message", StrUtil.nullToEmpty((String) (uploadResult != null ? uploadResult.get("message") : null)));
-			return out;
-		}
-		String path = (String) uploadResult.get("path");
-		String ossUrl = buildOssPublicUrl(bucket, path);
-		out.put("success", true);
-		out.put("message", "已下载并上传到 OSS");
-		out.put("ossUrl", ossUrl);
-		out.put("path", path);
-		out.put("bucket", bucket);
-		return out;
-	}
-
-	/**
-	 * 用 Playwright 启动 Chromium 打开抖音分享页，等待 video source 出现并取其 src（aweme 视频地址）。
-	 *
-	 * @param pageUrl 抖音分享链接（如 https://v.douyin.com/xxx）
-	 * @return 视频地址（以 https://www.douyin.com/aweme/ 开头），未找到则 null
-	 */
-	private static String scrapeDouyinVideoUrlWithPlaywright(String pageUrl) {
-		try (Playwright playwright = Playwright.create()) {
-			Browser browser = playwright.chromium().launch(new BrowserType.LaunchOptions().setHeadless(true));
-			try {
-				Page page = browser.newPage();
-				page.setDefaultNavigationTimeout(30_000);
-				page.setDefaultTimeout(20_000);
-				page.navigate(pageUrl);
-				// 等待 video source 出现（抖音页内视频源）
-				page.waitForSelector("video source");
-				String src = page.getAttribute("video source", "src");
-				if (StrUtil.isNotBlank(src) && src.startsWith("https://www.douyin.com/aweme/")) {
-					return src.trim();
-				}
-				return null;
-			} finally {
-				browser.close();
-			}
-		}
-	}
-
-	public static void main(String[] args) {
-		McpService client = new McpService();
-		System.out.println(client.helloWorld());
 	}
 }
