@@ -198,6 +198,68 @@ public class McpService {
         }
     }
 
+    /**
+     * 根据原始地址（raw_url）查询 OSS 中是否已存在对应视频。先查 raw_url/{md5}/target.txt，再查指向的 mp4 目录是否完整。
+     *
+     * @param rawUrl    原始地址（必填）
+     * @param ossBucket OSS 桶名（可选）
+     * @return JSON：success、exists（是否已存在视频）、path（存在时为视频路径）、message、bucket
+     */
+    @Tool(description = "根据原始地址（raw_url）查询是否已经存在对应视频。先查 raw_url 目录及指向的 mp4 目录是否完整，存在则返回 path。")
+    public String existsVideoByRawUrl(
+            @ToolParam(required = true, description = "原始地址（raw_url）") String rawUrl,
+            @ToolParam(required = false, description = "OSS 桶名，不填则使用配置文件中的 oss.bucket-name") String ossBucket) {
+        if (rawUrl == null || rawUrl.isBlank()) {
+            return toJsonExists(false, false, "rawUrl 不能为空", null, null);
+        }
+        String bucket = (ossBucket != null && !ossBucket.isBlank()) ? ossBucket.trim() : ossBucketName;
+        if (bucket.isBlank() || ossEndpoint.isBlank() || ossAccessKeyId.isBlank() || ossAccessKeySecret.isBlank()) {
+            return toJsonExists(false, false, "OSS 未配置完整", null, null);
+        }
+        String rawTargetKey = RAW_URL_PREFIX + md5Hex(rawUrl.trim()) + "/" + RAW_TARGET_TXT;
+        OSS ossClient = null;
+        try {
+            ossClient = new OSSClientBuilder().build(ossEndpoint, ossAccessKeyId, ossAccessKeySecret);
+            if (!ossClient.doesObjectExist(bucket, rawTargetKey)) {
+                return toJsonExists(true, false, "该原始地址下暂无视频", bucket, null);
+            }
+            String pointedMp4Ref = readOssObjectUtf8(ossClient, bucket, rawTargetKey);
+            if (pointedMp4Ref == null || pointedMp4Ref.isBlank()) {
+                return toJsonExists(true, false, "raw 指向内容无效", bucket, null);
+            }
+            String pointedUrlTxt = pointedMp4Ref.trim() + "/" + CACHE_URL_TXT;
+            String pointedVideoKey = pointedMp4Ref.trim() + "/" + CACHE_VIDEO_MP4;
+            if (!cacheExists(ossClient, bucket, pointedUrlTxt, pointedVideoKey)) {
+                return toJsonExists(true, false, "指向的 mp4 目录不完整", bucket, null);
+            }
+            return toJsonExists(true, true, "已存在视频", bucket, pointedVideoKey);
+        } catch (Exception e) {
+            return toJsonExists(false, false, "查询失败: " + e.getMessage(), null, null);
+        } finally {
+            if (ossClient != null) {
+                ossClient.shutdown();
+            }
+        }
+    }
+
+    private String toJsonExists(boolean success, boolean exists, String message, String bucket, String path) {
+        Map<String, Object> map = new LinkedHashMap<>();
+        map.put("success", success);
+        map.put("exists", exists);
+        map.put("message", message);
+        if (bucket != null) {
+            map.put("bucket", bucket);
+        }
+        if (path != null) {
+            map.put("path", path);
+        }
+        try {
+            return objectMapper.writeValueAsString(map);
+        } catch (JsonProcessingException e) {
+            return "{\"success\":false,\"exists\":false,\"message\":\"" + message.replace("\"", "\\\"") + "\"}";
+        }
+    }
+
     private String toJson(boolean success, String message, String bucket, String objectKey, String path, boolean cached) {
         Map<String, Object> map = new LinkedHashMap<>();
         map.put("success", success);
