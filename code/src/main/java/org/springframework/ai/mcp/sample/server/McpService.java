@@ -1,5 +1,8 @@
 package org.springframework.ai.mcp.sample.server;
 
+import cn.hutool.core.io.IoUtil;
+import cn.hutool.core.util.StrUtil;
+import cn.hutool.crypto.digest.DigestUtil;
 import com.aliyun.oss.OSS;
 import com.aliyun.oss.OSSClientBuilder;
 import com.aliyun.oss.model.ObjectMetadata;
@@ -11,17 +14,9 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.net.URI;
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -29,7 +24,6 @@ import java.util.Map;
 public class McpService {
 
     private final RestTemplate restTemplate = new RestTemplate();
-    private final ObjectMapper objectMapper = new ObjectMapper();
 
     @Value("${oss.endpoint:}")
     private String ossEndpoint;
@@ -75,28 +69,28 @@ public class McpService {
      * @param rawUrl       原始地址（可选），传入则以 md5(raw_url) 为目录名，目录内只存指向 mp4 目录的说明
      * @param ossBucket    OSS 桶名（可选）
      * @param ossObjectKey 保留兼容，实际使用 mp4_url/ 与 raw_url/ 目录
-     * @return JSON：success、message、cached、bucket、objectKey、path（视频在 OSS 上的路径，不含域名）
+     * @return 对象：success、message、cached、bucket、objectKey、path（视频在 OSS 上的路径，不含域名）
      */
-    @Tool(description = "从 MP4 地址下载并上传到 OSS。mp4 存于 mp4_url/{md5}/；可传 raw_url，则建 raw_url/{md5}/ 仅存指向 mp4 目录的说明。先查缓存再决定是否下载。返回 JSON，其中 path 为视频路径（不含完整地址）。")
-    public String downloadMp4AndUploadToOss(
+    @Tool(description = "从 MP4 地址下载并上传到 OSS。mp4 存于 mp4_url/{md5}/；可传 raw_url，则建 raw_url/{md5}/ 仅存指向 mp4 目录的说明。先查缓存再决定是否下载。直接返回结果对象。")
+    public Map<String, Object> downloadMp4AndUploadToOss(
             @ToolParam(required = true, description = "MP4 文件的下载地址") String mp4Url,
             @ToolParam(required = false, description = "原始地址；传入则以该地址的 MD5 为目录名，目录内只存指向 mp4 目录的说明") String rawUrl,
             @ToolParam(required = false, description = "OSS 桶名，不填则使用配置文件中的 oss.bucket-name") String ossBucket,
             @ToolParam(required = false, description = "保留兼容，实际使用 mp4_url/ 与 raw_url/ 目录") String ossObjectKey) {
-        if (mp4Url == null || mp4Url.isBlank()) {
-            return toJson(false, "mp4Url 不能为空", null, null, null, false);
+        if (StrUtil.isBlank(mp4Url)) {
+            return toResult(false, "mp4Url 不能为空", null, null, null, false);
         }
-        String bucket = (ossBucket != null && !ossBucket.isBlank()) ? ossBucket.trim() : ossBucketName;
-        if (bucket.isBlank() || ossEndpoint.isBlank() || ossAccessKeyId.isBlank() || ossAccessKeySecret.isBlank()) {
-            return toJson(false, "OSS 未配置完整，请在 application.properties 或环境变量中配置 oss.endpoint、oss.access-key-id、oss.access-key-secret、oss.bucket-name", null, null, null, false);
+        String bucket = StrUtil.isNotBlank(ossBucket) ? ossBucket.trim() : ossBucketName;
+        if (StrUtil.isBlank(bucket) || StrUtil.isBlank(ossEndpoint) || StrUtil.isBlank(ossAccessKeyId) || StrUtil.isBlank(ossAccessKeySecret)) {
+            return toResult(false, "OSS 未配置完整，请在 application.properties 或环境变量中配置 oss.endpoint、oss.access-key-id、oss.access-key-secret、oss.bucket-name", null, null, null, false);
         }
-        String mp4Md5 = md5Hex(mp4Url.trim());
+        String mp4Md5 = DigestUtil.md5Hex(mp4Url.trim());
         String mp4Dir = MP4_URL_PREFIX + mp4Md5 + "/";
         String urlTxtKey = mp4Dir + CACHE_URL_TXT;
         String videoKey = mp4Dir + CACHE_VIDEO_MP4;
 
-        boolean hasRawUrl = rawUrl != null && !rawUrl.isBlank();
-        String rawDir = hasRawUrl ? RAW_URL_PREFIX + md5Hex(rawUrl.trim()) + "/" : null;
+        boolean hasRawUrl = StrUtil.isNotBlank(rawUrl);
+        String rawDir = hasRawUrl ? RAW_URL_PREFIX + DigestUtil.md5Hex(rawUrl.trim()) + "/" : null;
         String rawTargetKey = hasRawUrl ? rawDir + RAW_TARGET_TXT : null;
         String mp4FolderRef = MP4_URL_PREFIX + mp4Md5; // raw 目录里 target.txt 的内容，指向 mp4 目录
 
@@ -108,22 +102,22 @@ public class McpService {
                 if (hasRawUrl && !ossClient.doesObjectExist(bucket, rawTargetKey)) {
                     putRawPointer(ossClient, bucket, rawTargetKey, mp4FolderRef);
                 }
-                return toJson(true, "命中缓存", bucket, videoKey, videoKey, true);
+                return toResult(true, "命中缓存", bucket, videoKey, videoKey, true);
             }
             // mp4 目录不完整：若传了 raw_url，看 raw 目录是否存在且指向的 mp4 目录是否完整，都完整则直接返回该视频 URL
             if (hasRawUrl && ossClient.doesObjectExist(bucket, rawTargetKey)) {
                 String pointedMp4Ref = readOssObjectUtf8(ossClient, bucket, rawTargetKey);
-                if (pointedMp4Ref != null && !pointedMp4Ref.isBlank()) {
+                if (StrUtil.isNotBlank(pointedMp4Ref)) {
                     String pointedUrlTxt = pointedMp4Ref.trim() + "/" + CACHE_URL_TXT;
                     String pointedVideoKey = pointedMp4Ref.trim() + "/" + CACHE_VIDEO_MP4;
                     if (cacheExists(ossClient, bucket, pointedUrlTxt, pointedVideoKey)) {
-                        return toJson(true, "命中缓存（通过 raw_url 指向）", bucket, pointedVideoKey, pointedVideoKey, true);
+                        return toResult(true, "命中缓存（通过 raw_url 指向）", bucket, pointedVideoKey, pointedVideoKey, true);
                     }
                 }
             }
             ResponseEntity<Resource> response = restTemplate.getForEntity(URI.create(mp4Url.trim()), Resource.class);
             if (!response.getStatusCode().is2xxSuccessful() || response.getBody() == null) {
-                return toJson(false, "下载失败：HTTP " + response.getStatusCode() + "，或响应体为空", null, null, null, false);
+                return toResult(false, "下载失败：HTTP " + response.getStatusCode() + "，或响应体为空", null, null, null, false);
             }
             Resource resource = response.getBody();
             long contentLength = response.getHeaders().getContentLength();
@@ -135,19 +129,18 @@ public class McpService {
             try (InputStream inputStream = resource.getInputStream()) {
                 ossClient.putObject(bucket, videoKey, inputStream, videoMeta);
             }
-            byte[] urlBytes = mp4Url.trim().getBytes(StandardCharsets.UTF_8);
             ObjectMetadata txtMeta = new ObjectMetadata();
-            txtMeta.setContentLength(urlBytes.length);
+            txtMeta.setContentLength(StrUtil.utf8Bytes(mp4Url.trim()).length);
             txtMeta.setContentType("text/plain; charset=utf-8");
-            ossClient.putObject(bucket, urlTxtKey, new ByteArrayInputStream(urlBytes), txtMeta);
+            ossClient.putObject(bucket, urlTxtKey, new ByteArrayInputStream(StrUtil.utf8Bytes(mp4Url.trim())), txtMeta);
 
             if (hasRawUrl) {
                 putRawPointer(ossClient, bucket, rawTargetKey, mp4FolderRef);
             }
 
-            return toJson(true, "上传成功", bucket, videoKey, videoKey, false);
+            return toResult(true, "上传成功", bucket, videoKey, videoKey, false);
         } catch (Exception e) {
-            return toJson(false, "失败: " + e.getMessage(), null, null, null, false);
+            return toResult(false, "失败: " + e.getMessage(), null, null, null, false);
         } finally {
             if (ossClient != null) {
                 ossClient.shutdown();
@@ -158,22 +151,15 @@ public class McpService {
     /** 从 OSS 读取对象内容为 UTF-8 字符串，失败或不存在返回 null */
     private static String readOssObjectUtf8(OSS ossClient, String bucket, String key) {
         try (com.aliyun.oss.model.OSSObject obj = ossClient.getObject(bucket, key);
-             InputStream in = obj.getObjectContent();
-             BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
-            StringBuilder sb = new StringBuilder();
-            String line;
-            while ((line = reader.readLine()) != null) {
-                if (sb.length() > 0) sb.append('\n');
-                sb.append(line);
-            }
-            return sb.toString();
+             InputStream in = obj.getObjectContent()) {
+            return IoUtil.readUtf8(in);
         } catch (Exception e) {
             return null;
         }
     }
 
     private static void putRawPointer(OSS ossClient, String bucket, String rawTargetKey, String mp4FolderRef) {
-        byte[] content = mp4FolderRef.getBytes(StandardCharsets.UTF_8);
+        byte[] content = StrUtil.utf8Bytes(mp4FolderRef);
         ObjectMetadata meta = new ObjectMetadata();
         meta.setContentLength(content.length);
         meta.setContentType("text/plain; charset=utf-8");
@@ -184,57 +170,43 @@ public class McpService {
         return ossClient.doesObjectExist(bucket, urlTxtKey) && ossClient.doesObjectExist(bucket, videoKey);
     }
 
-    private static String md5Hex(String input) {
-        try {
-            MessageDigest md = MessageDigest.getInstance("MD5");
-            byte[] digest = md.digest(input.getBytes(StandardCharsets.UTF_8));
-            StringBuilder sb = new StringBuilder(32);
-            for (byte b : digest) {
-                sb.append(String.format("%02x", b));
-            }
-            return sb.toString();
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("MD5 not available", e);
-        }
-    }
-
     /**
      * 根据原始地址（raw_url）查询 OSS 中是否已存在对应视频。先查 raw_url/{md5}/target.txt，再查指向的 mp4 目录是否完整。
      *
      * @param rawUrl    原始地址（必填）
      * @param ossBucket OSS 桶名（可选）
-     * @return JSON：success、exists（是否已存在视频）、path（存在时为视频路径）、message、bucket
+     * @return 对象：success、exists（是否已存在视频）、path（存在时为视频路径）、message、bucket
      */
-    @Tool(description = "根据原始地址（raw_url）查询是否已经存在对应视频。先查 raw_url 目录及指向的 mp4 目录是否完整，存在则返回 path。")
-    public String existsVideoByRawUrl(
+    @Tool(description = "根据原始地址（raw_url）查询是否已经存在对应视频。先查 raw_url 目录及指向的 mp4 目录是否完整，存在则返回 path。直接返回结果对象。")
+    public Map<String, Object> existsVideoByRawUrl(
             @ToolParam(required = true, description = "原始地址（raw_url）") String rawUrl,
             @ToolParam(required = false, description = "OSS 桶名，不填则使用配置文件中的 oss.bucket-name") String ossBucket) {
-        if (rawUrl == null || rawUrl.isBlank()) {
-            return toJsonExists(false, false, "rawUrl 不能为空", null, null);
+        if (StrUtil.isBlank(rawUrl)) {
+            return toResultExists(false, false, "rawUrl 不能为空", null, null);
         }
-        String bucket = (ossBucket != null && !ossBucket.isBlank()) ? ossBucket.trim() : ossBucketName;
-        if (bucket.isBlank() || ossEndpoint.isBlank() || ossAccessKeyId.isBlank() || ossAccessKeySecret.isBlank()) {
-            return toJsonExists(false, false, "OSS 未配置完整", null, null);
+        String bucket = StrUtil.isNotBlank(ossBucket) ? ossBucket.trim() : ossBucketName;
+        if (StrUtil.isBlank(bucket) || StrUtil.isBlank(ossEndpoint) || StrUtil.isBlank(ossAccessKeyId) || StrUtil.isBlank(ossAccessKeySecret)) {
+            return toResultExists(false, false, "OSS 未配置完整", null, null);
         }
-        String rawTargetKey = RAW_URL_PREFIX + md5Hex(rawUrl.trim()) + "/" + RAW_TARGET_TXT;
+        String rawTargetKey = RAW_URL_PREFIX + DigestUtil.md5Hex(rawUrl.trim()) + "/" + RAW_TARGET_TXT;
         OSS ossClient = null;
         try {
             ossClient = new OSSClientBuilder().build(ossEndpoint, ossAccessKeyId, ossAccessKeySecret);
             if (!ossClient.doesObjectExist(bucket, rawTargetKey)) {
-                return toJsonExists(true, false, "该原始地址下暂无视频", bucket, null);
+                return toResultExists(true, false, "该原始地址下暂无视频", bucket, null);
             }
             String pointedMp4Ref = readOssObjectUtf8(ossClient, bucket, rawTargetKey);
-            if (pointedMp4Ref == null || pointedMp4Ref.isBlank()) {
-                return toJsonExists(true, false, "raw 指向内容无效", bucket, null);
+            if (StrUtil.isBlank(pointedMp4Ref)) {
+                return toResultExists(true, false, "raw 指向内容无效", bucket, null);
             }
             String pointedUrlTxt = pointedMp4Ref.trim() + "/" + CACHE_URL_TXT;
             String pointedVideoKey = pointedMp4Ref.trim() + "/" + CACHE_VIDEO_MP4;
             if (!cacheExists(ossClient, bucket, pointedUrlTxt, pointedVideoKey)) {
-                return toJsonExists(true, false, "指向的 mp4 目录不完整", bucket, null);
+                return toResultExists(true, false, "指向的 mp4 目录不完整", bucket, null);
             }
-            return toJsonExists(true, true, "已存在视频", bucket, pointedVideoKey);
+            return toResultExists(true, true, "已存在视频", bucket, pointedVideoKey);
         } catch (Exception e) {
-            return toJsonExists(false, false, "查询失败: " + e.getMessage(), null, null);
+            return toResultExists(false, false, "查询失败: " + e.getMessage(), null, null);
         } finally {
             if (ossClient != null) {
                 ossClient.shutdown();
@@ -242,7 +214,7 @@ public class McpService {
         }
     }
 
-    private String toJsonExists(boolean success, boolean exists, String message, String bucket, String path) {
+    private static Map<String, Object> toResultExists(boolean success, boolean exists, String message, String bucket, String path) {
         Map<String, Object> map = new LinkedHashMap<>();
         map.put("success", success);
         map.put("exists", exists);
@@ -253,14 +225,10 @@ public class McpService {
         if (path != null) {
             map.put("path", path);
         }
-        try {
-            return objectMapper.writeValueAsString(map);
-        } catch (JsonProcessingException e) {
-            return "{\"success\":false,\"exists\":false,\"message\":\"" + message.replace("\"", "\\\"") + "\"}";
-        }
+        return map;
     }
 
-    private String toJson(boolean success, String message, String bucket, String objectKey, String path, boolean cached) {
+    private static Map<String, Object> toResult(boolean success, String message, String bucket, String objectKey, String path, boolean cached) {
         Map<String, Object> map = new LinkedHashMap<>();
         map.put("success", success);
         map.put("message", message);
@@ -274,11 +242,7 @@ public class McpService {
         if (path != null) {
             map.put("path", path);
         }
-        try {
-            return objectMapper.writeValueAsString(map);
-        } catch (JsonProcessingException e) {
-            return "{\"success\":false,\"message\":\"" + message.replace("\"", "\\\"") + "\",\"cached\":false}";
-        }
+        return map;
     }
 
     public static void main(String[] args) {

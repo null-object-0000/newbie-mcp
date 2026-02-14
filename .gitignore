@@ -34,3 +34,4 @@ out
 gen
 
 code/target/
+.vscode/settings.json
